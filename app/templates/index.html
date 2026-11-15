@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>发酵罐温度质控记录</title>
+  <style>
+    :root { --line:#d8dee6; --bg:#f5f7fa; --ok:#1a7f37; --bad:#c0392b; --warn:#b7791f; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:#1f2933; }
+    header { background:#14385c; color:#fff; padding:18px 28px; }
+    header h1 { margin:0; font-size:20px; }
+    header p { margin:6px 0 0; font-size:13px; opacity:.8; }
+    main { max-width:1080px; margin:22px auto; padding:0 18px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:20px; }
+    .card h2 { margin:0 0 12px; font-size:16px; color:#14385c; }
+    .toolbar { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    form { display:inline; }
+    button { border:0; border-radius:8px; padding:9px 18px; font-size:14px; cursor:pointer; }
+    .btn-primary { background:#1f6feb; color:#fff; }
+    .btn-ghost { background:#eef2f7; color:#14385c; border:1px solid var(--line); }
+    .btn-danger { background:#fbeaea; color:var(--bad); border:1px solid #e8c4c0; }
+    .flash { border-radius:8px; padding:11px 14px; margin-bottom:14px; font-size:14px; line-height:1.5; }
+    .flash.success { background:#e7f5ec; color:var(--ok); border:1px solid #b6dfc2; }
+    .flash.danger { background:#fdecea; color:var(--bad); border:1px solid #f0c4c0; }
+    .flash.warning { background:#fdf6e3; color:var(--warn); border:1px solid #ecd9a8; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid var(--line); padding:8px 10px; text-align:left; }
+    th { background:#f0f4f8; font-weight:600; white-space:nowrap; }
+    td.mono, .mono { font-family: ui-monospace,Menlo,Consolas,monospace; }
+    .muted { color:#7b8794; font-size:12px; }
+    .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
+    .pill.ok { background:#e7f5ec; color:var(--ok); }
+    .pill.rejected { background:#fdecea; color:var(--bad); }
+    .pill.error { background:#fdf6e3; color:var(--warn); }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+    @media (max-width:860px) { .grid2 { grid-template-columns:1fr; } }
+    .pager { margin-top:12px; display:flex; gap:10px; align-items:center; font-size:13px; }
+    code { background:#f0f4f8; padding:1px 5px; border-radius:4px; }
+    .empty { color:#7b8794; padding:18px 0; text-align:center; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>发酵罐温度日志 · 质控记录</h1>
+  <p>挂载目录：<code style="background:#234d75;color:#cfe3ff">{{ data_dir }}</code>　|　仅采集上次成功后新增的完整行，非法内容整轮拒绝</p>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  <div class="card">
+    <div class="toolbar">
+      <form method="post" action="{{ url_for('collect') }}">
+        <button class="btn-primary" type="submit">▶ 立即采集</button>
+      </form>
+      <a class="btn-ghost" style="text-decoration:none;padding:9px 18px;border-radius:8px"
+         href="{{ url_for('export_csv') }}">⬇ 下载 CSV</a>
+      <span class="muted">入库记录总数：<b>{{ total }}</b> 条</span>
+      {% if demo_reset %}
+      <form method="post" action="{{ url_for('demo_reset') }}"
+            onsubmit="return confirm('确认清空数据库与日志目录，重置演示？');">
+        <button class="btn-danger" type="submit">↺ 演示重置</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>目录中的日志文件</h2>
+      {% if files %}
+      <table>
+        <thead><tr><th>文件</th><th>inode</th><th>当前大小(B)</th></tr></thead>
+        <tbody>
+        {% for f in files %}
+          <tr><td class="mono">{{ f.name }}</td><td class="mono">{{ f.inode }}</td><td class="mono">{{ f.size }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">目录中暂无 active.ndjson / active.ndjson.1</div>{% endif %}
+    </div>
+    <div class="card">
+      <h2>采集进度（按 inode 持久化）</h2>
+      {% if states %}
+      <table>
+        <thead><tr><th>路径</th><th>inode</th><th>已采偏移</th><th>观测大小</th></tr></thead>
+        <tbody>
+        {% for s in states %}
+          <tr>
+            <td class="mono">{{ s.path }}</td><td class="mono">{{ s.inode }}</td>
+            <td class="mono">{{ s.offset }}</td><td class="mono">{{ s.file_size }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">尚无采集进度</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>最近采集轮次</h2>
+    {% if runs %}
+    <table>
+      <thead><tr>
+        <th>#</th><th>开始(UTC)</th><th>状态</th><th>扫描文件</th><th>完整行</th>
+        <th>新增</th><th>重复</th><th>半行(B)</th><th>说明 / 拒绝原因</th>
+      </tr></thead>
+      <tbody>
+      {% for r in runs %}
+        <tr>
+          <td class="mono">{{ r.id }}</td>
+          <td class="mono">{{ r.started_at }}</td>
+          <td><span class="pill {{ r.status }}">{{ r.status }}</span></td>
+          <td>{{ r.files_scanned }}</td><td>{{ r.lines_seen }}</td>
+          <td>{{ r.records_inserted }}</td><td>{{ r.duplicates }}</td>
+          <td>{{ r.half_line_bytes }}</td>
+          <td class="muted" style="max-width:380px;word-break:break-all">{{ r.error or '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<div class="empty">还没有执行过采集</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>质控记录（按序号倒序，每页 {{ page_size }} 条）</h2>
+    {% if rows %}
+    <table>
+      <thead><tr>
+        <th>序号 seq</th><th>UTC 时刻 ts</th><th>温度 temp</th>
+        <th>来源文件</th><th>inode</th><th>采集时间(UTC)</th><th>原始行 raw</th>
+      </tr></thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td class="mono">{{ r.seq }}</td>
+          <td class="mono">{{ r.ts }}</td>
+          <td class="mono">{{ '%.3f'|format(r.temp) }}</td>
+          <td class="mono">{{ r.source_path }}</td>
+          <td class="mono">{{ r.source_inode }}</td>
+          <td class="mono">{{ r.collected_at }}</td>
+          <td class="mono muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.raw }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="pager">
+      {% set total_pages = (total + page_size - 1) // page_size %}
+      <span>第 {{ page }} / {{ total_pages }} 页</span>
+      {% if page > 1 %}<a href="{{ url_for('index', page=page-1) }}">上一页</a>{% endif %}
+      {% if page < total_pages %}<a href="{{ url_for('index', page=page+1) }}">下一页</a>{% endif %}
+    </div>
+    {% else %}<div class="empty">暂无入库记录，点击“立即采集”开始</div>{% endif %}
+  </div>
+</main>
+</body>
+</html>

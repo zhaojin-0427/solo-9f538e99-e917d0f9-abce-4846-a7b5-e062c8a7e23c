@@ -1,0 +1,23 @@
+services:
+  web:
+    build: .
+    image: fermenter-qc:latest
+    container_name: fermenter-qc
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      DB_PATH: /instance/fermenter.db
+      ENABLE_DEMO_RESET: "1"
+      SECRET_KEY: change-me-in-production
+    volumes:
+      # 设备 NDJSON 日志的挂载目录（active.ndjson / active.ndjson.1）
+      - ./data:/data
+      # SQLite 数据库持久化目录
+      - ./db:/instance
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

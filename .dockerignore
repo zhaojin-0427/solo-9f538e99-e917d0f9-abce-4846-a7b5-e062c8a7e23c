@@ -1,0 +1,9 @@
+.git
+__pycache__/
+*.pyc
+tests/
+scripts/
+data/*
+db/*
+.gitignore
+README.md

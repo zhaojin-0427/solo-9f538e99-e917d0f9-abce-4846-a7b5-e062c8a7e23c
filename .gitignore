@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+db/*.db
+db/*.db-*
+data/active.ndjson
+data/active.ndjson.1
+data/.half.json
+.venv/
+.pytest_cache/
