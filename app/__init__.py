@@ -71,12 +71,14 @@ def create_app() -> Flask:
                 "success",
             )
         else:
-            level = "danger" if result["status"] == "rejected" else "warning"
+            if result["status"] == "rejected":
+                level, label = "danger", "拒绝"
+            elif result["status"] == "retry":
+                level, label = "warning", "暂缓（可重试）"
+            else:
+                level, label = "warning", "出错"
             flash(
-                "整轮{}（已入库记录与采集进度不变）：{}".format(
-                    "拒绝" if result["status"] == "rejected" else "出错",
-                    result["error"],
-                ),
+                "整轮{}（已入库记录与采集进度不变）：{}".format(label, result["error"]),
                 level,
             )
         return redirect(url_for("index"))

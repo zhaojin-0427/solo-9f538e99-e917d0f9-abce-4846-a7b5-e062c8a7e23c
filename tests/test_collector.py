@@ -257,6 +257,224 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(r["records_inserted"], 1)
         self.assertEqual(self.seqs(), ([1, 2], 2))
 
+    # ---- 文件身份与进度绑定：inode 消失/复用 ---------------------------------
+    def test_empty_round_with_no_files_forgets_progress(self):
+        """两份日志都不存在的空轮次必须作废旧 inode 进度。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        ino = os.stat(self.active).st_ino
+        self.assertEqual([s["inode"] for s in collector.list_file_states(self.db)], [ino])
+
+        os.remove(self.active)  # 设备删掉/移走旧文件，新文件尚未创建
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(collector.list_file_states(self.db), [], "缺席的 inode 进度必须作废")
+
+        # 新文件出现（即使文件系统复用了同一 inode），必须从文件头重新校验
+        self.write(self.active, rec(3) + "\n" + rec(4) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 2)
+        self.assertEqual(self.seqs(), ([1, 2, 3, 4], 4))
+        self.assertFalse(r["files"][0]["resumed"])
+
+    def test_inode_reuse_same_size_does_not_skip_following_seq(self):
+        """原缺陷：旧 inode 偏移被新文件继承，等长的新记录被静默跳过。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        old_state = collector.list_file_states(self.db)[0]
+        self.assertTrue(old_state["prefix_hash"])
+
+        # 旧文件消失、新文件立即可见（中间没有采集空轮次），序号 3/4 恰好等长
+        os.remove(self.active)
+        self.write(self.active, rec(3) + "\n" + rec(4) + "\n")
+        self.assertEqual(os.path.getsize(self.active), old_state["offset"])
+        new_ino = os.stat(self.active).st_ino
+
+        # 模拟文件系统把旧 inode 复用给新文件、旧偏移仍留在库里
+        with collector.get_db(self.db) as conn:
+            conn.execute("DELETE FROM file_state")
+            conn.execute(
+                "INSERT INTO file_state(inode, path, offset, file_size, prefix_hash, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (new_ino, self.active, old_state["offset"], os.path.getsize(self.active),
+                 old_state["prefix_hash"], "2026-01-01T00:00:00Z"),
+            )
+
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 2)
+        self.assertEqual(self.seqs(), ([1, 2, 3, 4], 4))
+        self.assertFalse(r["files"][0]["resumed"], "前缀指纹不一致时必须从头校验")
+        state = collector.list_file_states(self.db)[0]
+        self.assertEqual(state["offset"], os.path.getsize(self.active))
+
+    def test_inode_reuse_after_rotation_without_intervening_collect(self):
+        """旧 .1 被删除后其 inode 被新文件复用：同样不得继承旧偏移。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        stale = collector.list_file_states(self.db)[0]
+
+        # 轮转后旧文件被设备删除；新 active 出现（手动把旧进度塞给新 inode）
+        os.remove(self.active)
+        self.write(self.active, rec(2) + "\n" + rec(3) + "\n")
+        new_ino = os.stat(self.active).st_ino
+        with collector.get_db(self.db) as conn:
+            conn.execute("DELETE FROM file_state")
+            conn.execute(
+                "INSERT INTO file_state(inode, path, offset, file_size, prefix_hash, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (new_ino, self.active, stale["offset"], stale["file_size"],
+                 stale["prefix_hash"], "2026-01-01T00:00:00Z"),
+            )
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 2)
+        self.assertEqual(self.seqs(), ([1, 2, 3], 3))
+        # 记录来源 inode 正确指向新文件，旧状态不残留
+        self.assertEqual([s["inode"] for s in collector.list_file_states(self.db)], [new_ino])
+
+    def test_legacy_state_without_prefix_hash_is_revalidated(self):
+        """升级前写入的进度没有指纹：必须从头校验，且不重复入库。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        with collector.get_db(self.db) as conn:
+            conn.execute("UPDATE file_state SET prefix_hash = NULL")
+
+        self.write(self.active, rec(3) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 1)
+        self.assertEqual(r["duplicates"], 2)
+        self.assertEqual(self.seqs(), ([1, 2, 3], 3))
+        self.assertFalse(r["files"][0]["resumed"])
+        self.assertTrue(collector.list_file_states(self.db)[0]["prefix_hash"])
+
+    def test_rewritten_file_rejects_without_advancing_then_recovers(self):
+        """无法确认连续性（文件被就地改写、缺号）时整轮不推进，修复后可重试。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n" + rec(3) + "\n" + rec(4) + "\n")
+        collector.collect_once(self.data, self.db)
+        original_offset = collector.list_file_states(self.db)[0]["offset"]
+
+        # 文件被写成只剩 seq 6：前缀不一致 -> 从头校验 -> 发现缺号 5 -> 拒绝
+        self.write(self.active, rec(6) + "\n", mode="w")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "rejected")
+        self.assertIn("连续递增", r["error"])
+        self.assertEqual(self.seqs(), ([1, 2, 3, 4], 4))
+        self.assertEqual(collector.list_file_states(self.db)[0]["offset"], original_offset)
+
+        # 修复为 seq 5/6 后重试：同一偏移从头校验，5/6 正常入库，不重复不跳过
+        self.write(self.active, rec(5) + "\n" + rec(6) + "\n", mode="w")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 2)
+        self.assertEqual(self.seqs(), ([1, 2, 3, 4, 5, 6], 6))
+
+    def test_rotated_file_keeps_continuity_with_same_inode(self):
+        """轮转改名不改 inode/内容：旧文件继续按原偏移处理新增字节。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        ino1 = os.stat(self.active).st_ino
+        os.rename(self.active, self.rotated)
+        self.write(self.rotated, rec(2) + "\n")  # 旧文件续写
+        self.write(self.active, rec(3) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 2)
+        states = {s["inode"]: s for s in collector.list_file_states(self.db)}
+        self.assertEqual(states[ino1]["path"], self.rotated)
+        self.assertTrue(r["files"][0]["resumed"], "同 inode 同前缀的旧文件应续读")
+        self.assertEqual(self.seqs(), ([1, 2, 3], 3))
+
+    def test_legacy_schema_is_migrated_and_revalidated(self):
+        """旧库（file_state 无 prefix_hash）可自动升级，并按不可确认连续性处理。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        with collector.get_db(self.db) as conn:
+            conn.executescript(
+                "ALTER TABLE file_state RENAME TO file_state_new;"
+                "CREATE TABLE file_state (inode INTEGER PRIMARY KEY, path TEXT NOT NULL,"
+                " offset INTEGER NOT NULL, file_size INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+                "INSERT INTO file_state SELECT inode, path, offset, file_size, updated_at"
+                " FROM file_state_new;"
+                "DROP TABLE file_state_new;"
+            )
+        collector.init_db(self.db)  # 应补列而不破坏数据
+        with collector.get_db(self.db) as conn:
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(file_state)")}
+        self.assertIn("prefix_hash", columns)
+
+        self.write(self.active, rec(2) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual((r["records_inserted"], r["duplicates"]), (1, 1))
+        self.assertEqual(self.seqs(), ([1, 2], 2))
+
+    def test_retry_status_keeps_progress(self):
+        """无法确认连续性（并发替换/截断）时状态为 retry：不推进、可重试。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        offset = collector.list_file_states(self.db)[0]["offset"]
+
+        original = collector._read_file_chunk
+
+        def flaky(data_dir, info, states):
+            raise collector.RetryRound("模拟：文件在读取期间被替换，本轮不推进，请重试。")
+
+        collector._read_file_chunk = flaky
+        try:
+            r = collector.collect_once(self.data, self.db)
+        finally:
+            collector._read_file_chunk = original
+        self.assertEqual(r["status"], "retry")
+        self.assertIn("请重试", r["error"])
+        self.assertEqual(self.seqs(), ([1], 1))
+        self.assertEqual(collector.list_file_states(self.db)[0]["offset"], offset)
+        self.assertEqual(collector.list_runs(self.db)[0]["status"], "retry")
+
+        # 下一轮恢复正常
+        self.write(self.active, rec(2) + "\n")
+        r2 = collector.collect_once(self.data, self.db)
+        self.assertEqual(r2["status"], "ok", r2["error"])
+        self.assertEqual(self.seqs(), ([1, 2], 2))
+
+    def test_half_line_tampered_in_place_is_detected(self):
+        """半行被就地改写（偏移不变、总大小不变）也必须发现前缀不一致。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        half = rec(2, 26.0)
+        self.write(self.active, half[: len(half) // 2])
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["records_inserted"], 0)
+
+        # 就地改写半行内容（等长），再补全换行
+        prefix_len = len(rec(1) + "\n")
+        size = os.path.getsize(self.active)
+        with open(self.active, "r+b") as fh:
+            fh.seek(prefix_len)
+            fh.write(rec(2, 99.0)[: size - prefix_len].encode("utf-8"))
+        with open(self.active, "a", encoding="utf-8") as fh:
+            fh.write(rec(2, 99.0)[size - prefix_len:] + "\n")
+
+        r2 = collector.collect_once(self.data, self.db)
+        self.assertEqual(r2["status"], "ok", r2["error"])
+        self.assertEqual(r2["records_inserted"], 1)
+        rows, _ = collector.list_records(self.db)
+        self.assertEqual(sorted(x["seq"] for x in rows), [1, 2])
+        self.assertEqual({x["seq"]: x["temp"] for x in rows}[2], 99.0)
+        self.assertEqual(self.seqs(), ([1, 2], 2))
+
+    def test_duplicate_inode_paths_are_retried_not_guessed(self):
+        """两个日志路径指向同一 inode（硬链接等）时进度归属不唯一 -> 不推进。"""
+        self.write(self.active, rec(1) + "\n")
+        os.link(self.active, self.rotated)
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "retry")
+        self.assertEqual(self.seqs(), ([], 0))
+        self.assertEqual(collector.list_file_states(self.db), [])
+
     def test_interleaved_rotation_between_collects(self):
         # 采集 -> 轮转 -> 采集（旧文件无新增）-> 旧文件追加 + 新文件追加 -> 采集
         self.write(self.active, rec(1) + "\n")

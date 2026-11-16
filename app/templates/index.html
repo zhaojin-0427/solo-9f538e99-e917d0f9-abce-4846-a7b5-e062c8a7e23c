@@ -32,6 +32,7 @@
     .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
     .pill.ok { background:#e7f5ec; color:var(--ok); }
     .pill.rejected { background:#fdecea; color:var(--bad); }
+    .pill.retry { background:#fdf6e3; color:var(--warn); }
     .pill.error { background:#fdf6e3; color:var(--warn); }
     .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
     @media (max-width:860px) { .grid2 { grid-template-columns:1fr; } }
@@ -84,15 +85,20 @@
       {% else %}<div class="empty">目录中暂无 active.ndjson / active.ndjson.1</div>{% endif %}
     </div>
     <div class="card">
-      <h2>采集进度（按 inode 持久化）</h2>
+      <h2>采集进度（按 inode + 已采前缀指纹持久化）</h2>
+      <p class="muted" style="margin:0 0 10px">
+        inode 消失后进度立即作废；新文件若复用同一 inode，会先核对已采前缀 SHA-256，
+        不一致即从文件头重新校验，不会沿用旧偏移静默跳过序号。
+      </p>
       {% if states %}
       <table>
-        <thead><tr><th>路径</th><th>inode</th><th>已采偏移</th><th>观测大小</th></tr></thead>
+        <thead><tr><th>路径</th><th>inode</th><th>已采偏移</th><th>观测大小</th><th>前缀哈希(SHA-256)</th></tr></thead>
         <tbody>
         {% for s in states %}
           <tr>
             <td class="mono">{{ s.path }}</td><td class="mono">{{ s.inode }}</td>
             <td class="mono">{{ s.offset }}</td><td class="mono">{{ s.file_size }}</td>
+            <td class="mono muted">{{ (s.prefix_hash or '未确认（旧版本，将从文件头校验）')[:16] }}</td>
           </tr>
         {% endfor %}
         </tbody>
